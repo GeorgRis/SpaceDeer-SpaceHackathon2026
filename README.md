@@ -8,8 +8,9 @@ Prototype for monitoring reindeer grazing conditions in Northern Norway with Sen
 - calculates `NDVI` for vegetation / lichen health
 - calculates `NDWI` for moisture / possible ice crust conditions
 - derives a relative grazing suitability layer
-- estimates likely reindeer movement direction as a heuristic signal
-- shows the prediction on top of a normal Sentinel-2 satellite image
+- estimates an approximate herd position, recent path, and predicted next move as heuristic signals
+- shows the herd trace on top of a normal Sentinel-2 satellite image
+- includes a rough herd-size assumption based on favorable grazing area
 - provides both a script view and a small Streamlit app for area search
 
 ## Files
@@ -67,4 +68,4 @@ streamlit run streamlit_app.py
 - You do not need `INSTANCE_ID` for this version.
 - You do need a free CDSE account and OAuth client credentials.
 - Area search uses OpenStreetMap Nominatim geocoding.
-- Movement prediction is a heuristic based on vegetation and moisture signals, not a trained ecological migration model.
+- Herd position, path, and herd-size estimates are heuristics based on vegetation and moisture signals, not direct tracking or counted animals.

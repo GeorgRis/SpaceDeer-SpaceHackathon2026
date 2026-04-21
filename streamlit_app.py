@@ -57,7 +57,7 @@ def main() -> None:
     initialize_state()
 
     st.title("Reindeer Sentinel")
-    st.caption("Search an area, view the satellite scene, and see where grazing conditions suggest reindeer may drift next.")
+    st.caption("Search an area and monitor an estimated herd position, likely path, and rough herd size from grazing conditions.")
 
     with st.sidebar:
         st.subheader("Area Search")
@@ -93,8 +93,8 @@ def main() -> None:
         **Center:** `{center_lat:.5f}, {center_lon:.5f}`
         """
     )
-    intro_cols[1].info("You get a satellite view, a predicted direction, and a plain-language recommendation.")
-    intro_cols[2].warning("Prediction is heuristic. It shows the strongest environmental signal, not guaranteed herd behavior.")
+    intro_cols[1].info("You get an estimated past position, current position, predicted next position, and a rough herd-size assumption.")
+    intro_cols[2].warning("These are heuristic herd estimates from terrain conditions, not direct tracking or counted animals.")
 
     if run_analysis:
         if start_date >= default_end:
@@ -131,19 +131,22 @@ def main() -> None:
             st.stop()
 
         movement = analysis.movement
+        herd = analysis.herd
         target_label = (
             "Current area"
-            if movement["direction"] == "stable"
+            if movement["direction"] in {"stable", "diffuse"}
             else f"{movement['target_geo']['lat']:.4f}, {movement['target_geo']['lon']:.4f}"
         )
-        summary_cols = st.columns(3)
+        summary_cols = st.columns(4)
         summary_cols[0].metric("Likely direction", movement["direction"].replace("-", " ").title())
         summary_cols[1].metric("Confidence", f"{movement['confidence']:.0%}")
-        summary_cols[2].metric("Target point", target_label)
+        summary_cols[2].metric("Estimated herd", f"~{herd['estimated_count']}")
+        summary_cols[3].metric("Next point", target_label)
 
-        st.subheader("What this means")
+        st.subheader("Herd monitor")
         st.success(movement["recommendation"])
         st.write(movement_label(movement))
+        st.write(herd["assumption"])
         st.progress(int(movement["confidence"] * 100), text=f"Confidence in this signal: {movement['confidence']:.0%}")
 
         prediction_cols = st.columns((1.5, 1))
@@ -151,17 +154,29 @@ def main() -> None:
             prediction_figure = plot_prediction_map(analysis)
             st.pyplot(prediction_figure, clear_figure=True, use_container_width=True)
         with prediction_cols[1]:
-            st.markdown("**How to read the map**")
+            current_geo = herd["trace"]["current"]["geo"]
+            future_geo = herd["trace"]["future"]["geo"]
+            previous_geo = herd["trace"]["previous"]["geo"]
+            st.markdown("**How to read the herd path**")
             st.write("The background is a normal Sentinel-2 satellite image.")
             st.write("The warm overlay highlights only the strongest grazing-condition pockets, not the whole map.")
-            if movement["direction"] == "stable":
-                st.write("The ring around the center means the model does not see a strong directional shift right now.")
-                st.write("Suggested next focus: keep monitoring the current area rather than moving to a new sector.")
+            st.write(
+                f"Past position: `{previous_geo['lat']:.4f}, {previous_geo['lon']:.4f}`. "
+                f"Current position: `{current_geo['lat']:.4f}, {current_geo['lon']:.4f}`."
+            )
+            if movement["direction"] == "diffuse":
+                st.write("The highlighted hotspots are too spread out to support one reliable herd core in this view.")
+                st.write("Suggested next focus: zoom into a smaller area or use a shorter date range.")
+            elif movement["direction"] == "stable":
+                st.write("The ring around the current position means the herd is likely staying in roughly the same zone.")
+                st.write("Suggested next focus: keep monitoring the current area rather than shifting patrols.")
             else:
-                st.write("The arrow points from the selected area center toward the strongest current signal.")
+                st.write(
+                    "The dashed line shows the estimated recent path, and the red arrow shows the projected next move."
+                )
                 st.write(
                     f"Suggested next focus: **{movement['direction'].replace('-', ' ').title()}** sector around "
-                    f"`{movement['target_geo']['lat']:.4f}, {movement['target_geo']['lon']:.4f}`."
+                    f"`{future_geo['lat']:.4f}, {future_geo['lon']:.4f}`."
                 )
 
             metric_cols = st.columns(2)
@@ -170,18 +185,23 @@ def main() -> None:
             metric_cols = st.columns(2)
             metric_cols[0].metric("Mean NDVI", f"{analysis.summary['mean_ndvi']:.2f}")
             metric_cols[1].metric("Mean NDWI", f"{analysis.summary['mean_ndwi']:.2f}")
+            metric_cols = st.columns(2)
+            metric_cols[0].metric("Herd band", herd["band"].title())
+            metric_cols[1].metric("Usable grazing area", f"{herd['suitable_area_km2']:.1f} km2")
 
         with st.expander("See technical layers"):
             figure = plot_analysis(analysis)
             st.pyplot(figure, clear_figure=True, use_container_width=True)
 
         st.subheader("Operational interpretation")
-        if analysis.summary["favorable_share_percent"] >= 45:
-            st.success("This area has a solid share of potentially good grazing terrain, so the prediction is worth checking in the field.")
+        if movement["direction"] == "diffuse":
+            st.info("This result is too diffuse to trust as a single herd position. Reduce the radius or compare a narrower time window.")
+        elif analysis.summary["favorable_share_percent"] >= 45 and movement["direction"] != "stable":
+            st.success("The herd signal suggests animals may continue following the stronger grazing corridor visible in the selected area.")
         elif analysis.summary["risky_share_percent"] >= 40:
-            st.warning("Much of the area looks weaker, so animals may shift away from poor terrain and concentrate in a smaller zone.")
+            st.warning("Much of the area looks weaker, so the herd may compress into smaller favorable pockets or move out of poor terrain.")
         else:
-            st.info("Conditions are mixed. Try a tighter radius or another time window to sharpen the signal.")
+            st.info("Conditions are mixed. Treat this as a watchlist view and tighten the radius or change the time window for a sharper herd trace.")
     else:
         st.info("Pick an area, adjust the time window, and click Analyze area.")
 

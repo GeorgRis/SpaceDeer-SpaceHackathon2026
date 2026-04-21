@@ -36,6 +36,7 @@ class AreaAnalysis:
     suitability: np.ndarray
     summary: dict[str, float]
     movement: dict[str, Any]
+    herd: dict[str, Any]
 
 
 def load_dotenv(dotenv_path: str = ".env") -> None:
@@ -233,6 +234,32 @@ def _weighted_centroid(weights: np.ndarray) -> tuple[float, float]:
     return float(np.sum(grid_y * weights) / total), float(np.sum(grid_x * weights) / total)
 
 
+def _dominant_zone_centroid(weights: np.ndarray) -> tuple[tuple[float, float], float]:
+    """
+    Find the centroid of the strongest suitability cells instead of the full map average.
+
+    This avoids collapsing the estimated herd position into the center of the image
+    when the area is broadly uniform.
+    """
+    rows, cols = weights.shape
+    threshold = float(np.percentile(weights, 92))
+    hotspot = np.where(weights >= threshold, weights, 0.0)
+    hotspot_total = float(np.sum(hotspot))
+    total = float(np.sum(weights))
+    if hotspot_total <= 0 or total <= 0:
+        return (rows / 2.0, cols / 2.0), 0.0
+
+    centroid = _weighted_centroid(hotspot)
+    concentration = float(np.clip(hotspot_total / total, 0, 1))
+    return centroid, concentration
+
+
+def _clip_point(x: float, y: float, cols: int, rows: int) -> tuple[float, float]:
+    clipped_x = float(np.clip(x, 0, max(cols - 1, 0)))
+    clipped_y = float(np.clip(y, 0, max(rows - 1, 0)))
+    return clipped_x, clipped_y
+
+
 def _movement_direction(dx: float, dy: float) -> str:
     horizontal = "east" if dx > 0 else "west"
     vertical = "south" if dy > 0 else "north"
@@ -254,16 +281,18 @@ def predict_movement(
 
     This is a heuristic indicator, not a biologically validated migration model.
     """
-    current_centroid = _weighted_centroid(current_suitability)
+    current_centroid, current_concentration = _dominant_zone_centroid(current_suitability)
     rows, cols = current_suitability.shape
     center_y = rows / 2.0
     center_x = cols / 2.0
 
     if previous_suitability is not None:
-        previous_centroid = _weighted_centroid(previous_suitability)
+        previous_centroid, previous_concentration = _dominant_zone_centroid(previous_suitability)
         dy = current_centroid[0] - previous_centroid[0]
         dx = current_centroid[1] - previous_centroid[1]
     else:
+        previous_centroid = (center_y, center_x)
+        previous_concentration = 0.0
         dy = current_centroid[0] - center_y
         dx = current_centroid[1] - center_x
 
@@ -272,15 +301,29 @@ def predict_movement(
     vector_strength = float(np.hypot(normalized_dx, normalized_dy))
     direction = _movement_direction(normalized_dx, normalized_dy)
 
-    confidence = float(np.clip(vector_strength * 9.0, 0, 1))
-    if direction == "stable":
+    confidence = float(np.clip(vector_strength * 9.0 + current_concentration * 0.6, 0, 1))
+    if current_concentration < 0.12:
+        direction = "diffuse"
+        confidence = min(confidence, 0.3)
+    elif direction == "stable":
         confidence = min(confidence, 0.35)
+
+    future_x, future_y = _clip_point(
+        current_centroid[1] + dx * 1.35,
+        current_centroid[0] + dy * 1.35,
+        cols,
+        rows,
+    )
 
     return {
         "direction": direction,
         "confidence": confidence,
         "vector": {"dx": float(normalized_dx), "dy": float(normalized_dy)},
+        "previous_centroid": {"x": float(previous_centroid[1]), "y": float(previous_centroid[0])},
         "centroid": {"x": float(current_centroid[1]), "y": float(current_centroid[0])},
+        "future_centroid": {"x": future_x, "y": future_y},
+        "concentration": current_concentration,
+        "previous_concentration": previous_concentration,
     }
 
 
@@ -291,8 +334,61 @@ def pixel_to_geo(bbox_coords: list[float], cols: int, rows: int, x: float, y: fl
     return {"lat": float(lat), "lon": float(lon)}
 
 
+def estimate_herd_size(summary: dict[str, float], bbox_coords: list[float]) -> dict[str, Any]:
+    min_lon, min_lat, max_lon, max_lat = bbox_coords
+    center_lat = (min_lat + max_lat) / 2
+    width_km = (max_lon - min_lon) * 111.0 * max(np.cos(np.radians(center_lat)), 0.1)
+    height_km = (max_lat - min_lat) * 111.0
+    area_km2 = max(width_km * height_km, 1.0)
+    suitable_area_km2 = area_km2 * (summary["favorable_share_percent"] / 100.0)
+    estimated_count = int(np.clip(round(suitable_area_km2 * 1.6), 25, 1800))
+
+    if estimated_count < 120:
+        band = "small herd"
+    elif estimated_count < 400:
+        band = "medium herd"
+    else:
+        band = "large herd"
+
+    return {
+        "estimated_count": estimated_count,
+        "band": band,
+        "assumption": "Estimated from favorable grazing area and a simple density assumption, not direct observation.",
+        "suitable_area_km2": float(suitable_area_km2),
+        "area_km2": float(area_km2),
+    }
+
+
+def build_herd_trace(
+    movement: dict[str, Any],
+    bbox_coords: list[float],
+    rows: int,
+    cols: int,
+) -> dict[str, Any]:
+    previous_pixel = movement["previous_centroid"]
+    current_pixel = movement["centroid"]
+    future_pixel = movement["future_centroid"]
+
+    return {
+        "previous": {
+            "pixel": previous_pixel,
+            "geo": pixel_to_geo(bbox_coords, cols, rows, previous_pixel["x"], previous_pixel["y"]),
+        },
+        "current": {
+            "pixel": current_pixel,
+            "geo": pixel_to_geo(bbox_coords, cols, rows, current_pixel["x"], current_pixel["y"]),
+        },
+        "future": {
+            "pixel": future_pixel,
+            "geo": pixel_to_geo(bbox_coords, cols, rows, future_pixel["x"], future_pixel["y"]),
+        },
+    }
+
+
 def build_recommendation(summary: dict[str, float], movement: dict[str, Any]) -> str:
     direction = movement["direction"].replace("-", " ")
+    if direction == "diffuse":
+        return "The signal is too spread out to place the herd confidently in one core zone. Try a smaller area or a shorter time window."
     if direction == "stable":
         return "Keep monitoring the current area. The data does not show a strong directional pull toward a new sector right now."
     if summary["favorable_share_percent"] >= 45:
@@ -325,14 +421,16 @@ def analyze_area(
     summary = summarize_indices(ndvi, ndwi, suitability)
     movement = predict_movement(suitability, previous_suitability)
     rows, cols = suitability.shape
+    herd = estimate_herd_size(summary, bbox_coords)
     movement["target_geo"] = pixel_to_geo(
         bbox_coords,
         cols,
         rows,
-        movement["centroid"]["x"],
-        movement["centroid"]["y"],
+        movement["future_centroid"]["x"],
+        movement["future_centroid"]["y"],
     )
     movement["recommendation"] = build_recommendation(summary, movement)
+    herd["trace"] = build_herd_trace(movement, bbox_coords, rows, cols)
 
     return AreaAnalysis(
         bbox_coords=bbox_coords,
@@ -344,6 +442,7 @@ def analyze_area(
         suitability=suitability,
         summary=summary,
         movement=movement,
+        herd=herd,
     )
 
 
@@ -352,6 +451,7 @@ def movement_label(movement: dict[str, Any]) -> str:
     confidence = movement["confidence"]
 
     direction_labels = {
+        "diffuse": "Conditions are too evenly spread to identify one clear herd core in the selected area.",
         "stable": "Conditions look relatively stable within the selected area.",
         "north": "Conditions appear to improve toward the north.",
         "south": "Conditions appear to improve toward the south.",
@@ -368,25 +468,33 @@ def movement_label(movement: dict[str, Any]) -> str:
 
 def plot_prediction_map(analysis: AreaAnalysis) -> plt.Figure:
     rows, cols = analysis.suitability.shape
-    start_x = cols / 2.0
-    start_y = rows / 2.0
-    target_x = analysis.movement["centroid"]["x"]
-    target_y = analysis.movement["centroid"]["y"]
+    previous = analysis.herd["trace"]["previous"]["pixel"]
+    current = analysis.herd["trace"]["current"]["pixel"]
+    future = analysis.herd["trace"]["future"]["pixel"]
     direction = analysis.movement["direction"]
     confidence = analysis.movement["confidence"]
 
-    hotspot_threshold = float(np.percentile(analysis.suitability, 85))
+    hotspot_threshold = float(np.percentile(analysis.suitability, 92))
     hotspot_mask = np.where(analysis.suitability >= hotspot_threshold, analysis.suitability, np.nan)
 
     fig, ax = plt.subplots(figsize=(9, 8))
     ax.imshow(analysis.true_color)
     ax.imshow(hotspot_mask, cmap="autumn_r", alpha=0.38, vmin=hotspot_threshold, vmax=1)
-    ax.scatter(start_x, start_y, s=90, c="#16324f", edgecolors="white", linewidths=1.4, label="Selected center")
+    ax.plot(
+        [previous["x"], current["x"]],
+        [previous["y"], current["y"]],
+        color="#264653",
+        linewidth=2.6,
+        linestyle="--",
+        alpha=0.9,
+    )
+    ax.scatter(previous["x"], previous["y"], s=85, c="#2a9d8f", edgecolors="white", linewidths=1.2, label="Past position")
+    ax.scatter(current["x"], current["y"], s=115, c="#16324f", edgecolors="white", linewidths=1.4, label="Current position")
 
-    if direction == "stable" or confidence < 0.18:
+    if direction in {"stable", "diffuse"} or confidence < 0.18:
         stable_radius = max(min(rows, cols) * 0.06, 4)
         stable_ring = plt.Circle(
-            (start_x, start_y),
+            (current["x"], current["y"]),
             stable_radius,
             color="#16324f",
             fill=False,
@@ -395,22 +503,38 @@ def plot_prediction_map(analysis: AreaAnalysis) -> plt.Figure:
         )
         ax.add_patch(stable_ring)
     else:
-        ax.scatter(target_x, target_y, s=130, c="#c0392b", edgecolors="white", linewidths=1.2, label="Best signal")
+        ax.scatter(future["x"], future["y"], s=135, c="#c0392b", edgecolors="white", linewidths=1.2, label="Predicted next position")
         ax.annotate(
             "",
-            xy=(target_x, target_y),
-            xytext=(start_x, start_y),
+            xy=(future["x"], future["y"]),
+            xytext=(current["x"], current["y"]),
             arrowprops={"arrowstyle": "->", "lw": 3, "color": "#101820"},
+        )
+        ax.plot(
+            [current["x"], future["x"]],
+            [current["y"], future["y"]],
+            color="#c0392b",
+            linewidth=2.8,
+            alpha=0.9,
         )
 
     ax.text(
         0.02,
         0.02,
-        "No clear movement" if direction == "stable" else analysis.movement["direction"].replace("-", " ").title(),
+        "Diffuse signal" if direction == "diffuse" else "No clear movement" if direction == "stable" else analysis.movement["direction"].replace("-", " ").title(),
         transform=ax.transAxes,
         fontsize=12,
         color="white",
         bbox={"facecolor": "#101820", "alpha": 0.8, "boxstyle": "round,pad=0.35"},
+    )
+    ax.text(
+        0.02,
+        0.93,
+        f"Estimated herd: ~{analysis.herd['estimated_count']} ({analysis.herd['band']})",
+        transform=ax.transAxes,
+        fontsize=11,
+        color="white",
+        bbox={"facecolor": "#7f5539", "alpha": 0.84, "boxstyle": "round,pad=0.3"},
     )
     ax.set_title("Satellite view with predicted movement signal")
     ax.axis("off")
