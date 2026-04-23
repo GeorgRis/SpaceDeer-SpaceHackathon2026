@@ -57,7 +57,7 @@ def main() -> None:
     initialize_state()
 
     st.title("Reindeer Sentinel")
-    st.caption("Search an area and monitor an estimated herd position, likely path, and rough herd size from grazing conditions.")
+    st.caption("Search an area and identify the best grazing zone to guide the herd toward, with a likely route and rough herd size.")
 
     with st.sidebar:
         st.subheader("Area Search")
@@ -93,7 +93,7 @@ def main() -> None:
         **Center:** `{center_lat:.5f}, {center_lon:.5f}`
         """
     )
-    intro_cols[1].info("You get an estimated past position, current position, predicted next position, and a rough herd-size assumption.")
+    intro_cols[1].info("You get an estimated herd position, a recommended destination zone, and a likely route through the strongest terrain.")
     intro_cols[2].warning("These are heuristic herd estimates from terrain conditions, not direct tracking or counted animals.")
 
     if run_analysis:
@@ -157,7 +157,7 @@ def main() -> None:
             current_geo = herd["trace"]["current"]["geo"]
             future_geo = herd["trace"]["future"]["geo"]
             previous_geo = herd["trace"]["previous"]["geo"]
-            st.markdown("**How to read the herd path**")
+            st.markdown("**How to read the herd route**")
             st.write("The background is a normal Sentinel-2 satellite image.")
             st.write("The warm overlay highlights only the strongest grazing-condition pockets, not the whole map.")
             st.write(
@@ -168,14 +168,14 @@ def main() -> None:
                 st.write("The highlighted hotspots are too spread out to support one reliable herd core in this view.")
                 st.write("Suggested next focus: zoom into a smaller area or use a shorter date range.")
             elif movement["direction"] == "stable":
-                st.write("The ring around the current position means the herd is likely staying in roughly the same zone.")
-                st.write("Suggested next focus: keep monitoring the current area rather than shifting patrols.")
+                st.write("The ring around the current position means the herd is already close to one of the better zones in this view.")
+                st.write("Suggested next focus: keep them in the current area rather than pushing them onward.")
             else:
                 st.write(
-                    "The dashed line shows the estimated recent path, and the red arrow shows the projected next move."
+                    "The dashed line shows the estimated recent path, and the red route follows the strongest terrain toward the recommended grazing zone."
                 )
                 st.write(
-                    f"Suggested next focus: **{movement['direction'].replace('-', ' ').title()}** sector around "
+                    f"Suggested destination: **{movement['direction'].replace('-', ' ').title()}** sector around "
                     f"`{future_geo['lat']:.4f}, {future_geo['lon']:.4f}`."
                 )
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from heapq import heappop, heappush
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -272,6 +273,21 @@ def _movement_direction(dx: float, dy: float) -> str:
     return f"{vertical}-{horizontal}"
 
 
+def _direction_from_points(
+    start: tuple[float, float],
+    end: tuple[float, float],
+    rows: int,
+    cols: int,
+) -> tuple[str, dict[str, float], float]:
+    dy = end[0] - start[0]
+    dx = end[1] - start[1]
+    normalized_dx = dx / max(cols, 1)
+    normalized_dy = dy / max(rows, 1)
+    direction = _movement_direction(normalized_dx, normalized_dy)
+    strength = float(np.hypot(normalized_dx, normalized_dy))
+    return direction, {"dx": float(normalized_dx), "dy": float(normalized_dy)}, strength
+
+
 def predict_movement(
     current_suitability: np.ndarray,
     previous_suitability: np.ndarray | None = None,
@@ -327,11 +343,208 @@ def predict_movement(
     }
 
 
+def _local_patch_score(suitability: np.ndarray, row: int, col: int, radius: int = 3) -> float:
+    rows, cols = suitability.shape
+    row_min = max(0, row - radius)
+    row_max = min(rows, row + radius + 1)
+    col_min = max(0, col - radius)
+    col_max = min(cols, col + radius + 1)
+    patch = suitability[row_min:row_max, col_min:col_max]
+    return float(np.mean(patch))
+
+
 def pixel_to_geo(bbox_coords: list[float], cols: int, rows: int, x: float, y: float) -> dict[str, float]:
     min_lon, min_lat, max_lon, max_lat = bbox_coords
     lon = min_lon + (x / max(cols - 1, 1)) * (max_lon - min_lon)
     lat = max_lat - (y / max(rows - 1, 1)) * (max_lat - min_lat)
     return {"lat": float(lat), "lon": float(lon)}
+
+
+def _pixel_path_to_geo(
+    bbox_coords: list[float],
+    rows: int,
+    cols: int,
+    pixel_path: list[tuple[int, int]],
+) -> list[dict[str, float]]:
+    return [pixel_to_geo(bbox_coords, cols, rows, col, row) for row, col in pixel_path]
+
+
+def _least_cost_path(
+    suitability: np.ndarray,
+    ndwi: np.ndarray,
+    start: tuple[int, int],
+    goal: tuple[int, int],
+) -> list[tuple[int, int]]:
+    rows, cols = suitability.shape
+    start_row, start_col = start
+    goal_row, goal_col = goal
+    if start == goal:
+        return [start]
+
+    distances: dict[tuple[int, int], float] = {start: 0.0}
+    previous: dict[tuple[int, int], tuple[int, int]] = {}
+    queue: list[tuple[float, tuple[int, int]]] = [(0.0, start)]
+    visited: set[tuple[int, int]] = set()
+    neighbors = [
+        (-1, 0, 1.0),
+        (1, 0, 1.0),
+        (0, -1, 1.0),
+        (0, 1, 1.0),
+        (-1, -1, 1.414),
+        (-1, 1, 1.414),
+        (1, -1, 1.414),
+        (1, 1, 1.414),
+    ]
+
+    best_node = start
+    best_goal_distance = float(np.hypot(goal_row - start_row, goal_col - start_col))
+
+    while queue:
+        current_distance, current = heappop(queue)
+        if current in visited:
+            continue
+        visited.add(current)
+        if current == goal:
+            break
+
+        current_row, current_col = current
+        goal_distance = float(np.hypot(goal_row - current_row, goal_col - current_col))
+        if goal_distance < best_goal_distance:
+            best_goal_distance = goal_distance
+            best_node = current
+
+        for row_offset, col_offset, step_length in neighbors:
+            next_row = current_row + row_offset
+            next_col = current_col + col_offset
+            if not (0 <= next_row < rows and 0 <= next_col < cols):
+                continue
+
+            # High suitability is cheap to cross, low suitability is expensive.
+            cell_value = float(suitability[next_row, next_col])
+            wetness = float(ndwi[next_row, next_col])
+            if wetness >= 0.18:
+                continue
+
+            water_penalty = 1.0
+            if wetness > 0.08:
+                water_penalty += (wetness - 0.08) * 10.0
+
+            step_cost = (1.15 - cell_value) * water_penalty * step_length
+            next_node = (next_row, next_col)
+            next_distance = current_distance + max(step_cost, 0.03)
+
+            if next_distance < distances.get(next_node, float("inf")):
+                distances[next_node] = next_distance
+                previous[next_node] = current
+                heappush(queue, (next_distance, next_node))
+
+    if goal not in previous and goal != start:
+        goal = best_node
+        if goal == start:
+            return [start]
+
+    path = [goal]
+    node = goal
+    while node != start:
+        node = previous[node]
+        path.append(node)
+    path.reverse()
+    return path
+
+
+def _is_passable_cell(suitability: np.ndarray, ndwi: np.ndarray, row: int, col: int) -> bool:
+    return float(ndwi[row, col]) < 0.12 and float(suitability[row, col]) > 0.22
+
+
+def _select_best_destination(
+    suitability: np.ndarray,
+    ndwi: np.ndarray,
+    current_point: tuple[int, int],
+    previous_point: tuple[int, int],
+) -> tuple[int, int]:
+    rows, cols = suitability.shape
+    candidate_threshold = float(np.percentile(suitability, 95))
+    current_row, current_col = current_point
+    prev_row, prev_col = previous_point
+    base_direction_y = current_row - prev_row
+    base_direction_x = current_col - prev_col
+
+    best_cell = current_point
+    best_score = float("-inf")
+
+    for row in range(rows):
+        for col in range(cols):
+            if not _is_passable_cell(suitability, ndwi, row, col):
+                continue
+            cell_suitability = float(suitability[row, col])
+            local_score = _local_patch_score(suitability, row, col)
+            if max(cell_suitability, local_score) < candidate_threshold:
+                continue
+
+            distance = float(np.hypot(row - current_row, col - current_col))
+            if distance < 2.0:
+                continue
+
+            alignment_bonus = 0.0
+            if abs(base_direction_x) > 0.5 or abs(base_direction_y) > 0.5:
+                candidate_vec_x = col - current_col
+                candidate_vec_y = row - current_row
+                denom = float(
+                    np.hypot(base_direction_x, base_direction_y) * np.hypot(candidate_vec_x, candidate_vec_y)
+                )
+                if denom > 1e-6:
+                    alignment_bonus = max(
+                        ((base_direction_x * candidate_vec_x) + (base_direction_y * candidate_vec_y)) / denom,
+                        0.0,
+                    )
+
+            distance_bonus = min(distance / max(rows, cols), 0.35)
+            score = (local_score * 0.55) + (cell_suitability * 0.3) + (alignment_bonus * 0.1) + (distance_bonus * 0.05)
+
+            if score > best_score:
+                best_score = score
+                best_cell = (row, col)
+
+    return best_cell
+
+
+def _snap_to_passable_cell(
+    suitability: np.ndarray,
+    ndwi: np.ndarray,
+    point: tuple[int, int],
+    max_radius: int = 18,
+) -> tuple[int, int]:
+    rows, cols = suitability.shape
+    start_row, start_col = point
+    start_row = int(np.clip(start_row, 0, rows - 1))
+    start_col = int(np.clip(start_col, 0, cols - 1))
+
+    if _is_passable_cell(suitability, ndwi, start_row, start_col):
+        return start_row, start_col
+
+    best_cell = (start_row, start_col)
+    best_score = float("-inf")
+
+    for radius in range(1, max_radius + 1):
+        found_any = False
+        for row in range(max(0, start_row - radius), min(rows, start_row + radius + 1)):
+            for col in range(max(0, start_col - radius), min(cols, start_col + radius + 1)):
+                if max(abs(row - start_row), abs(col - start_col)) != radius:
+                    continue
+                if not _is_passable_cell(suitability, ndwi, row, col):
+                    continue
+
+                found_any = True
+                distance_penalty = float(np.hypot(row - start_row, col - start_col)) * 0.04
+                candidate_score = float(suitability[row, col]) - distance_penalty
+                if candidate_score > best_score:
+                    best_score = candidate_score
+                    best_cell = (row, col)
+
+        if found_any:
+            return best_cell
+
+    return best_cell
 
 
 def estimate_herd_size(summary: dict[str, float], bbox_coords: list[float]) -> dict[str, Any]:
@@ -361,27 +574,42 @@ def estimate_herd_size(summary: dict[str, float], bbox_coords: list[float]) -> d
 
 def build_herd_trace(
     movement: dict[str, Any],
+    suitability: np.ndarray,
+    ndwi: np.ndarray,
     bbox_coords: list[float],
     rows: int,
     cols: int,
 ) -> dict[str, Any]:
     previous_pixel = movement["previous_centroid"]
-    current_pixel = movement["centroid"]
-    future_pixel = movement["future_centroid"]
+    raw_current = (int(round(movement["centroid"]["y"])), int(round(movement["centroid"]["x"])))
+    raw_previous = (int(round(previous_pixel["y"])), int(round(previous_pixel["x"])))
+    start = _snap_to_passable_cell(
+        suitability,
+        ndwi,
+        raw_current,
+    )
+    snapped_previous = _snap_to_passable_cell(suitability, ndwi, raw_previous)
+    destination = _select_best_destination(suitability, ndwi, start, snapped_previous)
+    goal = _snap_to_passable_cell(suitability, ndwi, destination)
+    route_pixels = _least_cost_path(suitability, ndwi, start, goal)
+    snapped_current = {"x": float(start[1]), "y": float(start[0])}
+    snapped_future = {"x": float(route_pixels[-1][1]), "y": float(route_pixels[-1][0])}
 
     return {
         "previous": {
-            "pixel": previous_pixel,
-            "geo": pixel_to_geo(bbox_coords, cols, rows, previous_pixel["x"], previous_pixel["y"]),
+            "pixel": {"x": float(snapped_previous[1]), "y": float(snapped_previous[0])},
+            "geo": pixel_to_geo(bbox_coords, cols, rows, snapped_previous[1], snapped_previous[0]),
         },
         "current": {
-            "pixel": current_pixel,
-            "geo": pixel_to_geo(bbox_coords, cols, rows, current_pixel["x"], current_pixel["y"]),
+            "pixel": snapped_current,
+            "geo": pixel_to_geo(bbox_coords, cols, rows, snapped_current["x"], snapped_current["y"]),
         },
         "future": {
-            "pixel": future_pixel,
-            "geo": pixel_to_geo(bbox_coords, cols, rows, future_pixel["x"], future_pixel["y"]),
+            "pixel": snapped_future,
+            "geo": pixel_to_geo(bbox_coords, cols, rows, snapped_future["x"], snapped_future["y"]),
         },
+        "route_pixels": route_pixels,
+        "route_geo": _pixel_path_to_geo(bbox_coords, rows, cols, route_pixels),
     }
 
 
@@ -390,9 +618,9 @@ def build_recommendation(summary: dict[str, float], movement: dict[str, Any]) ->
     if direction == "diffuse":
         return "The signal is too spread out to place the herd confidently in one core zone. Try a smaller area or a shorter time window."
     if direction == "stable":
-        return "Keep monitoring the current area. The data does not show a strong directional pull toward a new sector right now."
+        return "The herd already appears close to one of the better grazing zones in the selected area."
     if summary["favorable_share_percent"] >= 45:
-        return f"Prioritize patrols and planning toward the {direction} part of the selected area where grazing conditions look strongest."
+        return f"Prioritize guiding the herd toward the {direction} part of the selected area where the grazing conditions look strongest."
     if summary["risky_share_percent"] >= 40:
         return f"Expect animals to avoid the weakest terrain and drift toward the {direction} side where conditions look relatively better."
     return f"Conditions are mixed, but the best short-term signal still points toward the {direction} sector."
@@ -422,15 +650,23 @@ def analyze_area(
     movement = predict_movement(suitability, previous_suitability)
     rows, cols = suitability.shape
     herd = estimate_herd_size(summary, bbox_coords)
-    movement["target_geo"] = pixel_to_geo(
-        bbox_coords,
-        cols,
+    herd["trace"] = build_herd_trace(movement, suitability, ndwi, bbox_coords, rows, cols)
+    current_pixel = herd["trace"]["current"]["pixel"]
+    future_pixel = herd["trace"]["future"]["pixel"]
+    direction, vector, route_strength = _direction_from_points(
+        (current_pixel["y"], current_pixel["x"]),
+        (future_pixel["y"], future_pixel["x"]),
         rows,
-        movement["future_centroid"]["x"],
-        movement["future_centroid"]["y"],
+        cols,
     )
+    if route_strength < 0.03:
+        direction = "stable"
+    movement["direction"] = direction
+    movement["vector"] = vector
+    movement["confidence"] = float(np.clip(max(movement["confidence"], route_strength * 8.0), 0, 1))
+    movement["future_centroid"] = future_pixel
+    movement["target_geo"] = herd["trace"]["future"]["geo"]
     movement["recommendation"] = build_recommendation(summary, movement)
-    herd["trace"] = build_herd_trace(movement, bbox_coords, rows, cols)
 
     return AreaAnalysis(
         bbox_coords=bbox_coords,
@@ -471,6 +707,7 @@ def plot_prediction_map(analysis: AreaAnalysis) -> plt.Figure:
     previous = analysis.herd["trace"]["previous"]["pixel"]
     current = analysis.herd["trace"]["current"]["pixel"]
     future = analysis.herd["trace"]["future"]["pixel"]
+    route_pixels = analysis.herd["trace"]["route_pixels"]
     direction = analysis.movement["direction"]
     confidence = analysis.movement["confidence"]
 
@@ -510,13 +747,26 @@ def plot_prediction_map(analysis: AreaAnalysis) -> plt.Figure:
             xytext=(current["x"], current["y"]),
             arrowprops={"arrowstyle": "->", "lw": 3, "color": "#101820"},
         )
-        ax.plot(
-            [current["x"], future["x"]],
-            [current["y"], future["y"]],
-            color="#c0392b",
-            linewidth=2.8,
-            alpha=0.9,
-        )
+        if len(route_pixels) >= 2:
+            route_rows = [row for row, _ in route_pixels]
+            route_cols = [col for _, col in route_pixels]
+            ax.plot(
+                route_cols,
+                route_rows,
+                color="#c0392b",
+                linewidth=2.8,
+                alpha=0.9,
+                label="Likely route",
+            )
+        else:
+            ax.plot(
+                [current["x"], future["x"]],
+                [current["y"], future["y"]],
+                color="#c0392b",
+                linewidth=2.8,
+                alpha=0.9,
+                label="Likely route",
+            )
 
     ax.text(
         0.02,
